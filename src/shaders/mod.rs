@@ -1,6 +1,6 @@
 //! Interfaz común de los fragment shaders y utilidades compartidas.
 
-use crate::math::{mix, saturate, Vec3};
+use crate::math::{mix, saturate, v3, Vec3};
 
 /// Todo lo que el renderer entrega al shader para un píxel cubierto por la esfera.
 /// Las direcciones están en espacio objeto (el modelo no se mueve, se mueve la cámara).
@@ -57,6 +57,46 @@ pub fn wrap_diffuse(ndotl: f32, wrap: f32) -> f32 {
     saturate((ndotl + wrap) / (1.0 + wrap))
 }
 
+/// Normal perturbada a partir del gradiente de un campo de altura 3D.
+/// No toca la geometría: solo cambia la normal usada para iluminar (bump mapping).
+/// Usa diferencias centradas: seis evaluaciones del campo.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn perturb_normal<F>(point: Vec3, normal: Vec3, strength: f32, eps: f32, height: F) -> Vec3
+where
+    F: Fn(Vec3) -> f32,
+{
+    let hx = height(point + v3(eps, 0.0, 0.0)) - height(point - v3(eps, 0.0, 0.0));
+    let hy = height(point + v3(0.0, eps, 0.0)) - height(point - v3(0.0, eps, 0.0));
+    let hz = height(point + v3(0.0, 0.0, eps)) - height(point - v3(0.0, 0.0, eps));
+    let grad = v3(hx, hy, hz) / (2.0 * eps);
+    // Solo la parte tangente a la superficie inclina la normal.
+    let surf = grad - normal * grad.dot(normal);
+    (normal - surf * strength).normalize()
+}
+
+/// Igual que `perturb_normal` pero con diferencias hacia adelante reutilizando la
+/// altura ya calculada en el punto: tres evaluaciones en vez de seis. Es la versión
+/// que usan los shaders en tiempo real.
+pub fn perturb_normal_fwd<F>(
+    point: Vec3,
+    normal: Vec3,
+    h0: f32,
+    strength: f32,
+    eps: f32,
+    height: F,
+) -> Vec3
+where
+    F: Fn(Vec3) -> f32,
+{
+    let grad = v3(
+        height(point + v3(eps, 0.0, 0.0)) - h0,
+        height(point + v3(0.0, eps, 0.0)) - h0,
+        height(point + v3(0.0, 0.0, eps)) - h0,
+    ) / eps;
+    let surf = grad - normal * grad.dot(normal);
+    (normal - surf * strength).normalize()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +128,29 @@ mod tests {
         let borde = fresnel(n, v3(1.0, 0.0, 0.02).normalize(), 0.04);
         assert!(borde > frente);
         assert!(borde <= 1.0 && frente >= 0.04);
+    }
+
+    #[test]
+    fn el_bump_inclina_la_normal_en_una_pendiente() {
+        let n = v3(0.0, 0.0, 1.0);
+        let p = v3(0.0, 0.0, 1.0);
+        // Altura que crece con x: la normal debe inclinarse hacia -x.
+        let perturbada = perturb_normal(p, n, 0.5, 1e-3, |q| q.x * 0.3);
+        assert!(perturbada.x < -0.01, "normal sin inclinar: {perturbada:?}");
+        assert!((perturbada.length() - 1.0).abs() < 1e-5);
+        // Campo plano: la normal no cambia.
+        let plana = perturb_normal(p, n, 0.5, 1e-3, |_| 1.0);
+        assert!((plana - n).length() < 1e-5);
+    }
+
+    #[test]
+    fn las_dos_versiones_del_bump_coinciden() {
+        let n = v3(0.0, 0.0, 1.0);
+        let p = v3(0.0, 0.0, 1.0);
+        let campo = |q: Vec3| 0.2 * q.x + 0.1 * q.y;
+        let centrada = perturb_normal(p, n, 0.5, 1e-3, campo);
+        let adelante = perturb_normal_fwd(p, n, campo(p), 0.5, 1e-3, campo);
+        assert!((centrada - adelante).length() < 1e-4);
     }
 
     #[test]
