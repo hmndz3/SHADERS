@@ -1,0 +1,19 @@
+[package]
+name = "shaders_cuerpos_celestes"
+version = "1.0.0"
+edition = "2021"
+description = "Renderer por software en CPU con shaders procedurales para una estrella, un planeta rocoso y un gigante gaseoso"
+
+[dependencies]
+minifb = "0.29"
+rayon = "1.10"
+png = "0.17"
+gif = "0.13"
+
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
