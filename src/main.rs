@@ -2,7 +2,9 @@
 //!
 //! Uso:
 //!   cargo run --release              abre la ventana interactiva
+//!   cargo run --release -- capturas  genera las imágenes y GIF en capturas/
 
+mod capture;
 mod framebuffer;
 mod math;
 mod noise;
@@ -15,6 +17,7 @@ use math::{rotate_y, v3};
 use minifb::{Key, Window, WindowOptions};
 use render::{Camera, Renderer};
 use shaders::{gas::GasGiant, rocky::Rocky, star::Star, Shader, Uniforms};
+use std::path::Path;
 use std::time::Instant;
 
 const ANCHO: usize = 900;
@@ -29,6 +32,7 @@ fn cuerpos() -> Vec<Box<dyn Shader>> {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let mesh = match obj::load("assets/sphere.obj") {
         Ok(m) => m,
         Err(e) => {
@@ -42,6 +46,41 @@ fn main() {
         mesh.vertices.len(),
         mesh.triangle_count()
     );
+
+    if args.iter().any(|a| a == "vista") {
+        // Vista rápida: una imagen chica de cada cuerpo, para revisar el diseño.
+        std::fs::create_dir_all("capturas").ok();
+        let cam = Camera::default();
+        let luz = v3(0.55, 0.35, 0.76);
+        for (nombre, sh) in [
+            ("vista_brasa.png", &cuerpos()[0]),
+            ("vista_terralba.png", &cuerpos()[1]),
+            ("vista_ambar.png", &cuerpos()[2]),
+        ] {
+            let fb = capture::frame(&mesh, sh.as_ref(), &cam, luz, 2.0, 420, 340, 1);
+            fb.save_png(format!("capturas/{nombre}")).unwrap();
+            println!("  {nombre}");
+        }
+        let mut despejado = shaders::rocky::Rocky::default();
+        despejado.cobertura_nubes = 0.0;
+        capture::frame(&mesh, &despejado, &cam, luz, 2.0, 420, 340, 1)
+            .save_png("capturas/vista_terralba_sin_nubes.png")
+            .unwrap();
+        println!("  vista_terralba_sin_nubes.png");
+        return;
+    }
+
+    if args.iter().any(|a| a == "capturas" || a == "--capturas") {
+        let dir = Path::new("capturas");
+        println!("Generando capturas en {}/ ...", dir.display());
+        let t0 = Instant::now();
+        if let Err(e) = capture::generar_todo(&mesh, dir) {
+            eprintln!("Error generando capturas: {e}");
+            std::process::exit(1);
+        }
+        println!("Listo en {:.1} s", t0.elapsed().as_secs_f32());
+        return;
+    }
 
     ventana(mesh);
 }
