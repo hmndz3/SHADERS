@@ -1,5 +1,5 @@
-//! Ruido procedural: simplex 3D (estilo OpenSimplex/Gustavson), fBm, ridged
-//! y turbulencia.
+//! Ruido procedural: simplex 3D (estilo OpenSimplex/Gustavson), fBm, ridged,
+//! turbulencia, celular (Worley) y deformación de dominio.
 //!
 //! Todo el ruido se evalúa en 3D sobre la dirección de la esfera, así que los
 //! patrones no tienen costuras ni polos: no se usan coordenadas UV planas.
@@ -190,6 +190,57 @@ impl Noise {
         sum / norm.max(1e-6)
     }
 
+    /// Ruido celular 3D. Devuelve (F1, F2): distancia al punto más cercano y al segundo.
+    pub fn worley(&self, p: Vec3) -> (f32, f32) {
+        let base = v3(p.x.floor(), p.y.floor(), p.z.floor());
+        let frac = p - base;
+        let mut f1 = f32::MAX;
+        let mut f2 = f32::MAX;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let cell = v3(
+                        base.x + dx as f32,
+                        base.y + dy as f32,
+                        base.z + dz as f32,
+                    );
+                    let feature = self.cell_point(cell);
+                    let d = (feature + v3(dx as f32, dy as f32, dz as f32) - frac).length();
+                    if d < f1 {
+                        f2 = f1;
+                        f1 = d;
+                    } else if d < f2 {
+                        f2 = d;
+                    }
+                }
+            }
+        }
+        (f1, f2)
+    }
+
+    /// Punto característico dentro de una celda, en [0, 1)^3.
+    fn cell_point(&self, cell: Vec3) -> Vec3 {
+        let h = hash3(
+            cell.x as i64,
+            cell.y as i64,
+            cell.z as i64,
+            self.seed,
+        );
+        v3(
+            ((h & 0xFFFF) as f32) / 65536.0,
+            (((h >> 16) & 0xFFFF) as f32) / 65536.0,
+            (((h >> 32) & 0xFFFF) as f32) / 65536.0,
+        )
+    }
+
+    /// Deformación de dominio: mueve el punto con el propio ruido antes de muestrear.
+    /// Es lo que vuelve "líquidas" las bandas del gigante gaseoso.
+    pub fn warp(&self, p: Vec3, amount: f32, freq: f32, octaves: u32) -> Vec3 {
+        let a = self.fbm(p * freq + v3(11.3, 4.7, 19.1), octaves, 2.0, 0.5);
+        let b = self.fbm(p * freq + v3(-7.9, 23.5, 2.1), octaves, 2.0, 0.5);
+        let c = self.fbm(p * freq + v3(31.7, -13.3, 8.8), octaves, 2.0, 0.5);
+        p + v3(a, b, c) * amount
+    }
 }
 
 /// Rotación fija entre octavas (ángulos irracionales) para romper la rejilla.
@@ -199,6 +250,17 @@ fn rotate_octave(p: Vec3) -> Vec3 {
         0.936 * p.y + 0.352 * p.x,
         -0.600 * p.x + 0.800 * p.z,
     )
+}
+
+fn hash3(x: i64, y: i64, z: i64, seed: u64) -> u64 {
+    let mut h = seed ^ 0x27D4_EB2F_1657_4DA1;
+    for v in [x, y, z] {
+        h ^= (v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h = h.rotate_left(29).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^= h >> 31;
+    }
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^ (h >> 33)
 }
 
 #[cfg(test)]
@@ -262,4 +324,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn worley_da_f1_menor_o_igual_que_f2() {
+        let n = Noise::new(3);
+        for i in 0..500 {
+            let p = v3(i as f32 * 0.17, 1.3, -0.9 + i as f32 * 0.03);
+            let (f1, f2) = n.worley(p);
+            assert!(f1 <= f2);
+            assert!(f1 >= 0.0 && f1 < 1.8, "f1 inesperado: {f1}");
+        }
+    }
+
+    #[test]
+    fn warp_desplaza_el_punto_de_forma_acotada() {
+        let n = Noise::new(11);
+        let p = v3(0.3, 0.4, 0.5);
+        let q = n.warp(p, 0.4, 2.0, 3);
+        let d = (q - p).length();
+        assert!(d > 0.0 && d < 0.4 * 1.8, "desplazamiento {d}");
+        assert_eq!(n.warp(p, 0.0, 2.0, 3), p);
+    }
 }
