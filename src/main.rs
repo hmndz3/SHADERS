@@ -2,6 +2,7 @@
 
 mod math;
 mod noise;
+mod obj;
 
 fn main() {
     println!("Laboratorio de shaders: planetas y estrellas");
