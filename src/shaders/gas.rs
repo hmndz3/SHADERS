@@ -1,26 +1,46 @@
 //! ÁMBAR — gigante gaseoso.
 //!
 //! Cadena de cálculo de un fragmento:
-//!   1. DEFORMACIÓN DE DOMINIO: fBm que mueve las coordenadas antes de calcular las
+//!   1. VÓRTICES: antes de evaluar nada, el punto se rota alrededor del centro de
+//!      cada tormenta con un ángulo que decae con la distancia. Eso curva las
+//!      bandas que pasan cerca y las arrastra hacia adentro.
+//!   2. CIZALLA: cada latitud se desplaza en longitud a distinta velocidad, así
+//!      los bordes entre bandas se rompen en remolinos.
+//!   3. DEFORMACIÓN DE DOMINIO: fBm que mueve las coordenadas antes de calcular las
 //!      bandas. Es lo que vuelve "líquida" la transición entre una barra y la otra.
-//!   2. BANDAS: suma de tres senos de distinta frecuencia sobre la latitud ya
+//!   4. BANDAS: suma de tres senos de distinta frecuencia sobre la latitud ya
 //!      deformada, más ruido ridged para los festones del borde.
-//!   3. COLOR: rampa ámbar de seis tonos.
-//!   4. LUZ: difusa suave, oscurecimiento de borde y halo atmosférico cálido.
+//!   5. COLOR: rampa ámbar, y la gran tormenta pinta encima con su propio fBm.
+//!   6. LUZ: difusa suave, oscurecimiento de borde y halo atmosférico cálido.
 
-use super::{ramp, wrap_diffuse, Fragment, Shader, Uniforms};
-use crate::math::{rotate_y, saturate, v3, Vec3};
+use super::{mix, ramp, wrap_diffuse, Fragment, Shader, Uniforms};
+use crate::math::{rotate_axis, rotate_y, saturate, smoothstep, v3, Vec3};
 use crate::noise::Noise;
+
+/// Una tormenta ciclónica: centro sobre la esfera, radio angular y giro.
+#[derive(Clone, Copy)]
+pub struct Tormenta {
+    pub centro: Vec3,
+    pub radio: f32,
+    pub fuerza: f32,
+    pub sentido: f32,
+}
 
 pub struct GasGiant {
     bandas_n: Noise,
     turbulencia_n: Noise,
+    vortice_n: Noise,
     /// Cantidad de bandas de polo a polo.
     pub frecuencia_bandas: f32,
     /// Cuánto deforma el ruido las bandas: 0 = barras rectas, alto = fluido.
     pub deformacion: f32,
+    /// Diferencia de velocidad entre bandas vecinas.
+    pub cizalla: f32,
     /// Velocidad general del flujo atmosférico.
     pub velocidad: f32,
+    /// Multiplicador del giro de todas las tormentas.
+    pub fuerza_tormenta: f32,
+    pub tormentas: Vec<Tormenta>,
 }
 
 impl Default for GasGiant {
@@ -28,9 +48,32 @@ impl Default for GasGiant {
         GasGiant {
             bandas_n: Noise::new(707),
             turbulencia_n: Noise::new(808),
+            vortice_n: Noise::new(909),
             frecuencia_bandas: 9.0,
             deformacion: 0.26,
+            cizalla: 0.55,
             velocidad: 0.20,
+            fuerza_tormenta: 1.0,
+            tormentas: vec![
+                Tormenta {
+                    centro: v3(0.62, -0.30, 0.72),
+                    radio: 0.46,
+                    fuerza: 2.6,
+                    sentido: 1.0,
+                },
+                Tormenta {
+                    centro: v3(-0.55, 0.42, 0.72),
+                    radio: 0.20,
+                    fuerza: 1.7,
+                    sentido: -1.0,
+                },
+                Tormenta {
+                    centro: v3(-0.20, -0.62, -0.75),
+                    radio: 0.16,
+                    fuerza: 1.4,
+                    sentido: 1.0,
+                },
+            ],
         }
     }
 }
@@ -45,9 +88,34 @@ const PALETA: [Vec3; 6] = [
 ];
 
 impl GasGiant {
-    /// Patrón de bandas en [0, 1], ya deformado y en movimiento.
+    /// Caída radial de una tormenta: 1 en el ojo, 0 fuera del radio.
+    pub fn influencia(&self, p: Vec3, t: &Tormenta) -> f32 {
+        let c = t.centro.normalize();
+        let d = saturate(p.dot(c)).min(1.0).acos();
+        1.0 - smoothstep(0.0, t.radio, d)
+    }
+
+    /// Aplica el remolino de todas las tormentas al punto de muestreo.
+    pub fn arremolinar(&self, p: Vec3, time: f32) -> Vec3 {
+        let mut q = p;
+        for t in &self.tormentas {
+            let w = self.influencia(p, t);
+            if w <= 0.0 {
+                continue;
+            }
+            let eje = t.centro.normalize();
+            let ang = t.sentido * self.fuerza_tormenta * (w * w * t.fuerza + time * 0.55 * w);
+            q = rotate_axis(q, eje, ang);
+        }
+        q
+    }
+
+    /// Patrón de bandas en [0, 1] ya deformado, arremolinado y con cizalla.
     pub fn patron(&self, p: Vec3, time: f32) -> f32 {
-        let q = rotate_y(p, time * 0.18);
+        let q = self.arremolinar(p, time);
+        // Cizalla: la velocidad angular depende de la latitud.
+        let vel = (q.y * self.frecuencia_bandas * 0.5).sin() * self.cizalla + 0.18;
+        let q = rotate_y(q, time * vel);
 
         let w = self
             .turbulencia_n
@@ -72,7 +140,7 @@ impl Shader for GasGiant {
     }
 
     fn descripcion(&self) -> &'static str {
-        "bandas líquidas por deformación de dominio"
+        "bandas líquidas por deformación de dominio y una gran tormenta"
     }
 
     fn shade(&self, f: &Fragment, u: &Uniforms) -> Vec3 {
@@ -81,6 +149,20 @@ impl Shader for GasGiant {
 
         let v = self.patron(p, t);
         let mut color = ramp(&PALETA, v);
+
+        // La gran tormenta pinta encima, con su propia textura y un anillo claro.
+        let principal = self.tormentas[0];
+        let w = self.influencia(p, &principal);
+        if w > 0.0 {
+            let eje = principal.centro.normalize();
+            let giro = rotate_axis(p, eje, w * w * principal.fuerza + t * 0.55 * w);
+            let tex = self.vortice_n.fbm(giro * 9.0, 4, 2.1, 0.5) * 0.5 + 0.5;
+            let cuerpo = mix(v3(0.72, 0.26, 0.14), v3(0.97, 0.70, 0.46), tex);
+            color = mix(color, cuerpo, smoothstep(0.10, 0.70, w) * 0.88);
+            // Anillo de nubes altas en el borde del ciclón.
+            let anillo = smoothstep(0.52, 0.66, w) * (1.0 - smoothstep(0.66, 0.82, w));
+            color = mix(color, v3(1.0, 0.95, 0.88), anillo * 0.55);
+        }
 
         // Iluminación: difusa suave, oscurecimiento de borde y halo cálido.
         let ndotl = f.normal.dot(f.light_dir);
@@ -98,7 +180,7 @@ impl Shader for GasGiant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::v3;
+    use crate::math::{tangent_frame, v3};
 
     fn frag(dir: Vec3) -> Fragment {
         let n = dir.normalize();
@@ -145,6 +227,7 @@ mod tests {
         let cruces = |k: f32| {
             let mut g = GasGiant::default();
             g.frecuencia_bandas = k;
+            g.tormentas.clear();
             let vals: Vec<f32> = (0..400)
                 .map(|i| {
                     let y = -0.98 + i as f32 * 0.0049;
@@ -160,15 +243,53 @@ mod tests {
     }
 
     #[test]
+    fn la_tormenta_curva_el_patron_a_su_alrededor() {
+        let g = GasGiant::default();
+        let mut sin_tormentas = GasGiant::default();
+        sin_tormentas.tormentas.clear();
+        let centro = g.tormentas[0].centro.normalize();
+        let (t, b) = tangent_frame(centro);
+
+        // Puntos en el anillo intermedio del vórtice: ahí la distorsión es máxima.
+        let mut diferentes = 0;
+        for i in 0..40 {
+            let a = i as f32 * 0.157;
+            let off = (t * a.cos() + b * a.sin()) * 0.30;
+            let p = (centro + off).normalize();
+            if (g.patron(p, 0.0) - sin_tormentas.patron(p, 0.0)).abs() > 0.05 {
+                diferentes += 1;
+            }
+        }
+        assert!(diferentes > 20, "la tormenta no curvó las bandas: {diferentes}/40");
+    }
+
+    #[test]
+    fn lejos_de_la_tormenta_el_patron_no_cambia() {
+        let g = GasGiant::default();
+        let mut sin_tormentas = GasGiant::default();
+        sin_tormentas.tormentas.clear();
+        let lejos = (-g.tormentas[0].centro).normalize();
+        // Se elige un punto alejado de todas las tormentas.
+        let p = if g.tormentas.iter().all(|t| g.influencia(lejos, t) <= 0.0) {
+            lejos
+        } else {
+            v3(0.0, 1.0, 0.0)
+        };
+        assert!((g.patron(p, 0.0) - sin_tormentas.patron(p, 0.0)).abs() < 1e-5);
+    }
+
+    #[test]
     fn la_deformacion_hace_que_las_bandas_dejen_de_ser_rectas() {
         let recto = {
             let mut g = GasGiant::default();
             g.deformacion = 0.0;
+            g.tormentas.clear();
             g
         };
         let fluido = {
             let mut g = GasGiant::default();
             g.deformacion = 0.45;
+            g.tormentas.clear();
             g
         };
         // Variación a lo largo de una misma latitud: con deformación debe ser mayor.
