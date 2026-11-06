@@ -1,16 +1,19 @@
 //! TERRALBA — planeta rocoso.
 //!
 //! Cadena de cálculo de un fragmento:
-//!   1. ALTURA: fBm con deformación de dominio para los continentes + ruido ridged
+//!   1. PARALLAX: se desplaza el punto de muestreo según la dirección de vista y la
+//!      altura del terreno, así el relieve "se corre" al mover la cámara.
+//!   2. ALTURA: fBm con deformación de dominio para los continentes + ruido ridged
 //!      para las cordilleras + detalle fino.
-//!   2. REGIONES: océano profundo / plataforma / playa / desierto / pradera / bosque
+//!   3. REGIONES: océano profundo / plataforma / playa / desierto / pradera / bosque
 //!      / roca / nieve / casquete polar, por altura, latitud y un campo de humedad.
-//!   3. BUMP MAPPING: se perturba la normal con el gradiente del campo de altura.
-//!   4. ILUMINACIÓN DIFERENCIADA: el océano responde con especular duro + Fresnel,
+//!   4. BUMP MAPPING: se perturba la normal con el gradiente del campo de altura.
+//!   5. ILUMINACIÓN DIFERENCIADA: el océano responde con especular duro + Fresnel,
 //!      la tierra es mate, la nieve tiene un brillo ancho.
-//!   5. SOMBRAS DE NUBES: se busca la nube que está entre el punto y la luz.
-//!   6. NUBES: capa procedural que gira a su propio ritmo y se mezcla encima.
-//!   7. ATMÓSFERA: borde azul por Fresnel y rojo en el terminador.
+//!   6. SOMBRAS DE NUBES: se busca la nube que está entre el punto y la luz.
+//!   7. NOCHE: luces de ciudad procedurales solo en el hemisferio oscuro.
+//!   8. NUBES: capa procedural que gira a su propio ritmo y se mezcla encima.
+//!   9. ATMÓSFERA: borde azul por Fresnel y rojo en el terminador.
 
 use super::{
     blinn_phong, fresnel, mix, perturb_normal_fwd, wrap_diffuse, Fragment, Shader, Uniforms,
@@ -23,6 +26,7 @@ pub struct Rocky {
     detalle: Noise,
     humedad: Noise,
     nubes_n: Noise,
+    ciudades: Noise,
     /// Altura que separa el agua de la tierra. Subirlo inunda los continentes.
     pub nivel_mar: f32,
     /// Escala de los continentes. Más alto = continentes más chicos y numerosos.
@@ -35,6 +39,10 @@ pub struct Rocky {
     pub altura_nubes: f32,
     /// Fuerza del bump mapping sobre el terreno.
     pub fuerza_relieve: f32,
+    /// Desplazamiento máximo del parallax.
+    pub fuerza_parallax: f32,
+    /// Brillo de las luces de ciudad del lado nocturno.
+    pub brillo_ciudades: f32,
     /// Intensidad del reflejo especular del océano. En 0 el agua queda mate,
     /// igual que la tierra.
     pub brillo_oceano: f32,
@@ -47,12 +55,15 @@ impl Default for Rocky {
             detalle: Noise::new(22),
             humedad: Noise::new(33),
             nubes_n: Noise::new(44),
+            ciudades: Noise::new(55),
             nivel_mar: 0.50,
             escala_continentes: 1.40,
             cobertura_nubes: 0.50,
             velocidad_nubes: 0.030,
             altura_nubes: 0.045,
             fuerza_relieve: 0.30,
+            fuerza_parallax: 0.038,
+            brillo_ciudades: 1.7,
             brillo_oceano: 11.0,
         }
     }
@@ -85,6 +96,29 @@ impl Rocky {
     /// Humedad en [0, 1]: decide desierto contra bosque.
     pub fn humedad(&self, p: Vec3) -> f32 {
         saturate(self.humedad.fbm(p * 2.4 + v3(17.0, 3.0, -9.0), 3, 2.1, 0.5) * 0.5 + 0.5)
+    }
+
+    /// PARALLAX. Corre el punto de muestreo en la dirección contraria a la vista,
+    /// proporcional a la altura del terreno. Dos iteraciones para que no se estire
+    /// en los bordes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn parallax(&self, p: Vec3, n: Vec3, view: Vec3) -> Vec3 {
+        self.parallax_con_altura(p, n, view, self.altura(p))
+    }
+
+    /// Variante que recibe la altura ya calculada, para no evaluarla dos veces.
+    pub fn parallax_con_altura(&self, p: Vec3, n: Vec3, view: Vec3, h: f32) -> Vec3 {
+        let alto = h - self.nivel_mar;
+        if self.fuerza_parallax <= 0.0 || alto <= 0.0 {
+            return p; // sobre el mar no hay relieve que desplazar
+        }
+        let vz = view.dot(n);
+        if vz < 0.12 {
+            return p; // vista casi rasante: el desplazamiento se dispara, no se aplica
+        }
+        let (t, b) = tangent_frame(n);
+        let d = (alto * self.fuerza_parallax / vz).min(self.fuerza_parallax * 1.5);
+        (p - (t * view.dot(t) + b * view.dot(b)) * d).normalize()
     }
 
     /// Densidad de nubes en [0, 1] para una dirección y un instante.
@@ -120,6 +154,22 @@ impl Rocky {
         self.nubes(q, time)
     }
 
+    /// Luces de ciudad: grano celular fino dentro de regiones habitadas grandes.
+    pub fn luces_ciudad(&self, p: Vec3, altura_rel: f32, lat: f32) -> f32 {
+        let region = smoothstep(
+            0.52,
+            0.72,
+            self.ciudades.fbm(p * 3.2, 3, 2.0, 0.5) * 0.5 + 0.5,
+        );
+        if region <= 0.0 {
+            return 0.0;
+        }
+        let (f1, _) = self.ciudades.worley(p * 52.0);
+        let grano = 1.0 - smoothstep(0.03, 0.22, f1);
+        let costa = smoothstep(0.0, 0.08, altura_rel) * (1.0 - smoothstep(0.22, 0.50, altura_rel));
+        let clima = 1.0 - smoothstep(0.62, 0.80, lat);
+        grano * region * costa * clima
+    }
 }
 
 impl Shader for Rocky {
@@ -128,7 +178,7 @@ impl Shader for Rocky {
     }
 
     fn descripcion(&self) -> &'static str {
-        "continentes, relieve y nubes procedurales con su sombra"
+        "continentes, bump, parallax, nubes con sombra y luces nocturnas"
     }
 
     fn shade(&self, f: &Fragment, u: &Uniforms) -> Vec3 {
@@ -136,10 +186,15 @@ impl Shader for Rocky {
         let l = f.light_dir;
         let v = f.view_dir;
 
-        let p = f.dir;
-        let h = self.altura(p);
+        // 1. PARALLAX. La altura en el punto original decide cuánto se corre el
+        //    muestreo según la vista. Sobre el mar no hay desplazamiento.
+        let p0 = f.dir;
+        let h0 = self.altura(p0);
+        let p = self.parallax_con_altura(p0, n_geo, v, h0);
+        let movido = p != p0;
+        let h = if movido { self.altura(p) } else { h0 };
 
-        // 1. Clasificación de la superficie.
+        // 2. Clasificación de la superficie.
         let lat = p.y.abs();
         let es_tierra = smoothstep(self.nivel_mar - 0.004, self.nivel_mar + 0.004, h);
         let altura_rel = saturate((h - self.nivel_mar) / 0.42);
@@ -178,7 +233,7 @@ impl Shader for Rocky {
         let mut albedo = mix(color_agua, color_tierra, es_tierra);
         albedo = mix(albedo, NIEVE, hielo);
 
-        // 2. BUMP MAPPING. El gradiente del campo de altura inclina la normal.
+        // 3. BUMP MAPPING. El gradiente del campo de altura inclina la normal.
         //    En el agua se usa un microoleaje de alta frecuencia, mucho más suave.
         let relieve = self.fuerza_relieve * es_tierra * (1.0 - hielo * 0.6);
         let n_terreno = if relieve > 0.0 {
@@ -206,10 +261,10 @@ impl Shader for Rocky {
 
         let ndotl = n.dot(l);
 
-        // 3. SOMBRAS DE NUBES sobre la superficie.
+        // 4. SOMBRAS DE NUBES sobre la superficie.
         let factor_sombra = 1.0 - 0.72 * self.sombra_nubes(p, n_geo, l, u.time);
 
-        // 4. RESPUESTAS DISTINTAS A LA LUZ según la región.
+        // 5. RESPUESTAS DISTINTAS A LA LUZ según la región.
         //    Océano: difusa baja + especular duro con Fresnel.
         //    Tierra: mate, con wrap para un terminador suave.
         //    Nieve/hielo: especular ancho y débil.
@@ -234,18 +289,29 @@ impl Shader for Rocky {
         };
         color = color * factor_sombra;
 
-        // 5. La capa de nubes se evalúa una sola vez: tapa las luces y se mezcla
+        // 6. La capa de nubes se evalúa una sola vez: tapa las luces y se mezcla
         //    encima de la superficie.
         let nub = self.nubes(p, u.time);
 
-        // 6. NUBES encima de todo, con su propia iluminación.
+        // 7. LADO NOCTURNO: luces de ciudad procedurales.
+        let noche = 1.0 - smoothstep(-0.14, 0.16, ndotl);
+        if noche > 0.001 && es_tierra > 0.0 && self.brillo_ciudades > 0.0 {
+            let luces = self.luces_ciudad(p, altura_rel, lat) * es_tierra * (1.0 - hielo);
+            color += v3(1.00, 0.80, 0.42)
+                * luces
+                * noche
+                * (1.0 - 0.85 * nub)
+                * self.brillo_ciudades;
+        }
+
+        // 8. NUBES encima de todo, con su propia iluminación.
         if nub > 0.001 {
             let luz_nube = wrap_diffuse(n_geo.dot(l), 0.22);
             let color_nube = mix(v3(0.42, 0.46, 0.55), v3(1.0, 0.99, 0.97), luz_nube);
             color = mix(color, color_nube, nub * 0.93);
         }
 
-        // 7. ATMÓSFERA: dispersión azul en el borde y rojo en el terminador.
+        // 9. ATMÓSFERA: dispersión azul en el borde y rojo en el terminador.
         let borde = saturate(1.0 - saturate(n_geo.dot(v)));
         let halo = borde.powf(3.2);
         // Para la atmósfera se usa la intensidad difusa que entrega el renderer
@@ -495,6 +561,74 @@ mod tests {
         let a = liso.shade(&f, &u);
         let b = rugoso.shade(&f, &u);
         assert!((a - b).length() > 0.005, "el relieve no afectó la luz: {a:?} vs {b:?}");
+    }
+
+    #[test]
+    fn el_parallax_depende_de_la_camara() {
+        let r = Rocky::default();
+        let mut movidos = 0;
+        for i in 0..300 {
+            let a = i as f32 * 0.19;
+            let p = v3(a.cos(), (a * 0.5).sin() * 0.6, a.sin()).normalize();
+            let (t, _) = tangent_frame(p);
+            let v1 = p;
+            let v2 = (p * 0.6 + t * 0.8).normalize();
+            let q1 = r.parallax(p, p, v1);
+            let q2 = r.parallax(p, p, v2);
+            if (q1 - q2).length() > 1e-4 {
+                movidos += 1;
+            }
+        }
+        assert!(movidos > 60, "el parallax casi no movió nada: {movidos}/300");
+    }
+
+    #[test]
+    fn sin_fuerza_el_parallax_no_mueve_nada() {
+        let mut r = Rocky::default();
+        r.fuerza_parallax = 0.0;
+        let p = v3(0.3, 0.2, 0.93).normalize();
+        let (t, _) = tangent_frame(p);
+        let v = (p * 0.6 + t * 0.8).normalize();
+        assert_eq!(r.parallax(p, p, v), p);
+    }
+
+    #[test]
+    fn el_lado_nocturno_muestra_luces_y_el_diurno_no() {
+        let r = Rocky::default();
+        let mut apagado = Rocky::default();
+        apagado.brillo_ciudades = 0.0;
+        let u = Uniforms { time: 0.0 };
+
+        let mut ciudades = 0;
+        for p in direcciones(20000) {
+            let h = r.altura(p);
+            if h <= r.nivel_mar {
+                continue;
+            }
+            let altura_rel = saturate((h - r.nivel_mar) / 0.42);
+            if r.luces_ciudad(p, altura_rel, p.y.abs()) < 0.25 || r.nubes(p, 0.0) > 0.3 {
+                continue;
+            }
+            ciudades += 1;
+            // De noche las luces suman brillo...
+            let noche = r.shade(&frag(p, -p, p), &u);
+            let noche_sin = apagado.shade(&frag(p, -p, p), &u);
+            assert!(
+                noche.x > noche_sin.x + 0.01,
+                "las luces no se ven de noche: {noche:?} vs {noche_sin:?}"
+            );
+            // ...y de día no cambian nada.
+            let dia = r.shade(&frag(p, p, p), &u);
+            let dia_sin = apagado.shade(&frag(p, p, p), &u);
+            assert!(
+                (dia - dia_sin).length() < 1e-6,
+                "las luces no deberían verse de día"
+            );
+            if ciudades >= 5 {
+                break;
+            }
+        }
+        assert!(ciudades >= 5, "se hallaron pocas ciudades: {ciudades}");
     }
 
     #[test]
