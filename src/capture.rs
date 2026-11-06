@@ -1,7 +1,7 @@
-//! Generación de las capturas PNG del README, sin abrir ventana.
+//! Generación de las capturas PNG y los GIF del README, sin abrir ventana.
 
 use crate::framebuffer::Framebuffer;
-use crate::math::{v3, Vec3};
+use crate::math::{rotate_axis, v3, Vec3};
 use crate::obj::Mesh;
 use crate::render::{Camera, Renderer};
 use crate::shaders::gas::GasGiant;
@@ -35,6 +35,26 @@ pub fn frame(
     fb.downsample(ss)
 }
 
+fn guardar_gif(
+    ruta: &Path,
+    cuadros: Vec<Framebuffer>,
+    delay_centisegundos: u16,
+) -> Result<(), String> {
+    let (w, h) = (cuadros[0].width as u16, cuadros[0].height as u16);
+    let file = std::fs::File::create(ruta).map_err(|e| e.to_string())?;
+    let mut enc = gif::Encoder::new(std::io::BufWriter::new(file), w, h, &[])
+        .map_err(|e| e.to_string())?;
+    enc.set_repeat(gif::Repeat::Infinite)
+        .map_err(|e| e.to_string())?;
+    for fb in cuadros {
+        let mut datos = fb.to_rgb8();
+        let mut f = gif::Frame::from_rgb_speed(w, h, &mut datos, 10);
+        f.delay = delay_centisegundos;
+        enc.write_frame(&f).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Centro de la gran tormenta del gigante gaseoso, visto de frente.
 fn camara_hacia(dir: Vec3, distancia: f32) -> Camera {
     let d = dir.normalize();
@@ -59,6 +79,7 @@ pub fn generar_todo(mesh: &Mesh, dir: &Path) -> Result<(), String> {
     let luz_camara = cam.eye().normalize();
 
     let (pw, ph, pss) = (900usize, 700usize, 2usize);
+    let (gw, gh, gss) = (260usize, 260usize, 2usize);
 
     // --- Capturas fijas -----------------------------------------------------
     let fijas: Vec<(&str, &dyn Shader, Camera, Vec3, f32)> = vec![
@@ -125,6 +146,87 @@ pub fn generar_todo(mesh: &Mesh, dir: &Path) -> Result<(), String> {
     frame(mesh, &nublado(0.12), &cam_rasante, luz_sombras, 0.0, 700, 700, 2)
         .save_png(dir.join("terralba_sombras_alta.png"))?;
 
+    // --- Animaciones --------------------------------------------------------
+    let n = 30;
+
+    println!("  animando brasa_material.gif");
+    let cuadros = (0..n)
+        .map(|i| {
+            frame(
+                mesh,
+                &estrella,
+                &cam,
+                luz_frontal,
+                i as f32 * 0.9,
+                gw,
+                gh,
+                gss,
+            )
+        })
+        .collect();
+    guardar_gif(&dir.join("brasa_material.gif"), cuadros, 8)?;
+
+    println!("  animando terralba_nubes.gif");
+    let cuadros = (0..n)
+        .map(|i| frame(mesh, &rocoso, &cam, luz_frontal, i as f32 * 1.4, gw, gh, gss))
+        .collect();
+    guardar_gif(&dir.join("terralba_nubes.gif"), cuadros, 8)?;
+
+    println!("  animando terralba_dia_noche.gif");
+    let cuadros = (0..n)
+        .map(|i| {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            let luz = v3(a.sin(), 0.22, a.cos());
+            frame(mesh, &rocoso, &cam, luz, 0.0, gw, gh, gss)
+        })
+        .collect();
+    guardar_gif(&dir.join("terralba_dia_noche.gif"), cuadros, 8)?;
+
+    println!("  animando terralba_parallax.gif");
+    let cuadros = (0..n)
+        .map(|i| {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            let c = Camera {
+                distancia: 2.2,
+                yaw: 0.9 + 0.30 * a.sin(),
+                pitch: 0.10 + 0.12 * a.cos(),
+                ..Camera::default()
+            };
+            frame(mesh, &con_parallax, &c, luz_frontal, 0.0, gw, gh, gss)
+        })
+        .collect();
+    guardar_gif(&dir.join("terralba_parallax.gif"), cuadros, 8)?;
+
+    println!("  animando terralba_sombras.gif");
+    let cuadros = (0..n)
+        .map(|i| {
+            // La nube no se mueve (tiempo fijo): lo único que gira es la luz, así
+            // se ve que la sombra la sigue.
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            let luz = rotate_axis(luz_sombras.normalize(), v3(0.0, 1.0, 0.0), 0.8 * a.sin());
+            frame(mesh, &nublado(0.09), &cam_rasante, luz, 0.0, gw, gh, gss)
+        })
+        .collect();
+    guardar_gif(&dir.join("terralba_sombras.gif"), cuadros, 8)?;
+
+    println!("  animando ambar_tormenta.gif");
+    let cam_tormenta = camara_hacia(v3(0.62, -0.30, 0.72), 2.45);
+    let cuadros = (0..n)
+        .map(|i| {
+            frame(
+                mesh,
+                &gas,
+                &cam_tormenta,
+                luz_frontal,
+                i as f32 * 1.1,
+                gw,
+                gh,
+                gss,
+            )
+        })
+        .collect();
+    guardar_gif(&dir.join("ambar_tormenta.gif"), cuadros, 8)?;
+
     Ok(())
 }
 
@@ -175,4 +277,30 @@ mod tests {
         std::fs::remove_file(&ruta).ok();
     }
 
+    #[test]
+    fn se_escribe_un_gif_con_varios_cuadros() {
+        let dir = std::env::temp_dir().join("shaders_prueba_gif");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ruta = dir.join("prueba.gif");
+        let mesh = esfera();
+        let cuadros: Vec<_> = (0..3)
+            .map(|i| {
+                frame(
+                    &mesh,
+                    &GasGiant::default(),
+                    &Camera::default(),
+                    v3(0.5, 0.4, 0.8),
+                    i as f32,
+                    24,
+                    24,
+                    1,
+                )
+            })
+            .collect();
+        guardar_gif(&ruta, cuadros, 10).unwrap();
+        let bytes = std::fs::read(&ruta).unwrap();
+        assert_eq!(&bytes[..6], b"GIF89a");
+        assert!(bytes.len() > 100);
+        std::fs::remove_file(&ruta).ok();
+    }
 }
