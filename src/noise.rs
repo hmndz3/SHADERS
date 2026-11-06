@@ -1,4 +1,5 @@
-//! Ruido procedural: simplex 3D (estilo OpenSimplex/Gustavson).
+//! Ruido procedural: simplex 3D (estilo OpenSimplex/Gustavson), fBm, ridged
+//! y turbulencia.
 //!
 //! Todo el ruido se evalúa en 3D sobre la dirección de la esfera, así que los
 //! patrones no tienen costuras ni polos: no se usan coordenadas UV planas.
@@ -137,6 +138,58 @@ impl Noise {
         32.0 * n
     }
 
+    /// Suma de octavas clásica. Cada octava se rota para que no se alineen los ejes.
+    pub fn fbm(&self, p: Vec3, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
+        let mut amp = 0.5;
+        let mut freq = 1.0;
+        let mut sum = 0.0;
+        let mut norm = 0.0;
+        let mut q = p;
+        for _ in 0..octaves {
+            sum += self.simplex3(q * freq) * amp;
+            norm += amp;
+            freq *= lacunarity;
+            amp *= gain;
+            q = rotate_octave(q);
+        }
+        sum / norm.max(1e-6)
+    }
+
+    /// Valor absoluto de las octavas: crea vetas y filamentos. Rango [0, 1].
+    pub fn turbulence(&self, p: Vec3, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
+        let mut amp = 0.5;
+        let mut freq = 1.0;
+        let mut sum = 0.0;
+        let mut norm = 0.0;
+        let mut q = p;
+        for _ in 0..octaves {
+            sum += self.simplex3(q * freq).abs() * amp;
+            norm += amp;
+            freq *= lacunarity;
+            amp *= gain;
+            q = rotate_octave(q);
+        }
+        sum / norm.max(1e-6)
+    }
+
+    /// Ruido ridged: crestas afiladas, bueno para cordilleras y fibras de plasma.
+    pub fn ridged(&self, p: Vec3, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
+        let mut amp = 0.5;
+        let mut freq = 1.0;
+        let mut sum = 0.0;
+        let mut norm = 0.0;
+        let mut q = p;
+        for _ in 0..octaves {
+            let n = 1.0 - self.simplex3(q * freq).abs();
+            sum += n * n * amp;
+            norm += amp;
+            freq *= lacunarity;
+            amp *= gain;
+            q = rotate_octave(q);
+        }
+        sum / norm.max(1e-6)
+    }
+
 }
 
 /// Rotación fija entre octavas (ángulos irracionales) para romper la rejilla.
@@ -193,6 +246,20 @@ mod tests {
         let p = v3(0.7, 1.2, -0.3);
         let q = p + v3(1e-4, 0.0, 0.0);
         assert!((n.simplex3(p) - n.simplex3(q)).abs() < 1e-2);
+    }
+
+    #[test]
+    fn fbm_queda_acotado_y_turbulencia_es_positiva() {
+        let n = Noise::new(5);
+        for i in 0..2000 {
+            let p = v3(i as f32 * 0.07, i as f32 * -0.031, 2.0);
+            let f = n.fbm(p, 6, 2.0, 0.5);
+            assert!((-1.05..=1.05).contains(&f), "fbm fuera de rango: {f}");
+            let t = n.turbulence(p, 5, 2.0, 0.5);
+            assert!((0.0..=1.05).contains(&t), "turbulencia fuera de rango: {t}");
+            let r = n.ridged(p, 5, 2.0, 0.5);
+            assert!((0.0..=1.05).contains(&r), "ridged fuera de rango: {r}");
+        }
     }
 
 }
