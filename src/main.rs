@@ -1,5 +1,6 @@
 //! Laboratorio de shaders: una misma esfera, tres cuerpos celestes.
 
+mod framebuffer;
 mod math;
 mod noise;
 mod obj;
