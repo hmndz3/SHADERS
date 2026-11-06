@@ -8,22 +8,31 @@
 //!   3. BUMP MAPPING: se perturba la normal con el gradiente del campo de altura.
 //!   4. ILUMINACIÓN DIFERENCIADA: el océano responde con especular duro + Fresnel,
 //!      la tierra es mate, la nieve tiene un brillo ancho.
-//!   5. ATMÓSFERA: borde azul por Fresnel y rojo en el terminador.
+//!   5. SOMBRAS DE NUBES: se busca la nube que está entre el punto y la luz.
+//!   6. NUBES: capa procedural que gira a su propio ritmo y se mezcla encima.
+//!   7. ATMÓSFERA: borde azul por Fresnel y rojo en el terminador.
 
 use super::{
     blinn_phong, fresnel, mix, perturb_normal_fwd, wrap_diffuse, Fragment, Shader, Uniforms,
 };
-use crate::math::{saturate, smoothstep, v3, Vec3};
+use crate::math::{rotate_y, saturate, smoothstep, tangent_frame, v3, Vec3};
 use crate::noise::Noise;
 
 pub struct Rocky {
     relieve: Noise,
     detalle: Noise,
     humedad: Noise,
+    nubes_n: Noise,
     /// Altura que separa el agua de la tierra. Subirlo inunda los continentes.
     pub nivel_mar: f32,
     /// Escala de los continentes. Más alto = continentes más chicos y numerosos.
     pub escala_continentes: f32,
+    /// Fracción de cielo cubierto por nubes (0 despejado, 1 cerrado).
+    pub cobertura_nubes: f32,
+    /// Velocidad de rotación de la capa de nubes (independiente del terreno).
+    pub velocidad_nubes: f32,
+    /// Altura de la capa de nubes: controla cuánto se separa la sombra de la nube.
+    pub altura_nubes: f32,
     /// Fuerza del bump mapping sobre el terreno.
     pub fuerza_relieve: f32,
     /// Intensidad del reflejo especular del océano. En 0 el agua queda mate,
@@ -37,8 +46,12 @@ impl Default for Rocky {
             relieve: Noise::new(11),
             detalle: Noise::new(22),
             humedad: Noise::new(33),
+            nubes_n: Noise::new(44),
             nivel_mar: 0.50,
             escala_continentes: 1.40,
+            cobertura_nubes: 0.50,
+            velocidad_nubes: 0.030,
+            altura_nubes: 0.045,
             fuerza_relieve: 0.30,
             brillo_oceano: 11.0,
         }
@@ -74,6 +87,39 @@ impl Rocky {
         saturate(self.humedad.fbm(p * 2.4 + v3(17.0, 3.0, -9.0), 3, 2.1, 0.5) * 0.5 + 0.5)
     }
 
+    /// Densidad de nubes en [0, 1] para una dirección y un instante.
+    /// La capa gira alrededor del eje Y a su propia velocidad, distinta del terreno.
+    pub fn nubes(&self, p: Vec3, time: f32) -> f32 {
+        let q = rotate_y(p, time * self.velocidad_nubes);
+        let w = self.nubes_n.warp(q * 1.9, 0.30, 1.5, 1);
+        let masa = self.nubes_n.fbm(w, 4, 2.3, 0.55) * 0.5 + 0.5;
+        let jirones = self
+            .nubes_n
+            .turbulence(q * 4.5 + v3(0.0, time * 0.015, 0.0), 3, 2.0, 0.5);
+        let v = masa * 0.84 + jirones * 0.16;
+        let umbral = 1.0 - self.cobertura_nubes;
+        smoothstep(umbral, umbral + 0.22, v)
+    }
+
+    /// SOMBRAS DE NUBES. Desde el punto de superficie se avanza hacia la luz por la
+    /// componente tangente de su dirección, una distancia que depende de la altura
+    /// de la capa y de lo rasante que llegue la luz. Si la luz está cenital la
+    /// sombra cae justo debajo de la nube; si llega baja, se alarga hacia el día.
+    pub fn sombra_nubes(&self, p: Vec3, n: Vec3, light: Vec3, time: f32) -> f32 {
+        let c = n.dot(light);
+        if c <= 0.03 {
+            return 0.0; // de noche no hay sombra que proyectar
+        }
+        let tang = light - n * c;
+        let lt = tang.length();
+        if lt < 1e-5 {
+            return self.nubes(p, time);
+        }
+        let d = (self.altura_nubes * lt / c).min(0.40);
+        let q = (p + tang / lt * d).normalize();
+        self.nubes(q, time)
+    }
+
 }
 
 impl Shader for Rocky {
@@ -82,7 +128,7 @@ impl Shader for Rocky {
     }
 
     fn descripcion(&self) -> &'static str {
-        "continentes, biomas y relieve por bump mapping"
+        "continentes, relieve y nubes procedurales con su sombra"
     }
 
     fn shade(&self, f: &Fragment, u: &Uniforms) -> Vec3 {
@@ -142,7 +188,7 @@ impl Shader for Rocky {
         };
         let n = if es_tierra < 1.0 {
             let oleaje = |q: Vec3| {
-                self.detalle
+                self.nubes_n
                     .fbm(q * 45.0 + v3(0.0, u.time * 0.25, u.time * 0.1), 2, 2.0, 0.5)
             };
             let n_agua = perturb_normal_fwd(
@@ -160,7 +206,10 @@ impl Shader for Rocky {
 
         let ndotl = n.dot(l);
 
-        // 3. RESPUESTAS DISTINTAS A LA LUZ según la región.
+        // 3. SOMBRAS DE NUBES sobre la superficie.
+        let factor_sombra = 1.0 - 0.72 * self.sombra_nubes(p, n_geo, l, u.time);
+
+        // 4. RESPUESTAS DISTINTAS A LA LUZ según la región.
         //    Océano: difusa baja + especular duro con Fresnel.
         //    Tierra: mate, con wrap para un terminador suave.
         //    Nieve/hielo: especular ancho y débil.
@@ -183,8 +232,20 @@ impl Shader for Rocky {
         } else {
             luz_tierra
         };
+        color = color * factor_sombra;
 
-        // 4. ATMÓSFERA: dispersión azul en el borde y rojo en el terminador.
+        // 5. La capa de nubes se evalúa una sola vez: tapa las luces y se mezcla
+        //    encima de la superficie.
+        let nub = self.nubes(p, u.time);
+
+        // 6. NUBES encima de todo, con su propia iluminación.
+        if nub > 0.001 {
+            let luz_nube = wrap_diffuse(n_geo.dot(l), 0.22);
+            let color_nube = mix(v3(0.42, 0.46, 0.55), v3(1.0, 0.99, 0.97), luz_nube);
+            color = mix(color, color_nube, nub * 0.93);
+        }
+
+        // 7. ATMÓSFERA: dispersión azul en el borde y rojo en el terminador.
         let borde = saturate(1.0 - saturate(n_geo.dot(v)));
         let halo = borde.powf(3.2);
         // Para la atmósfera se usa la intensidad difusa que entrega el renderer
@@ -200,7 +261,7 @@ impl Shader for Rocky {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::{tangent_frame, v3};
+    use crate::math::v3;
 
     fn frag(dir: Vec3, light: Vec3, view: Vec3) -> Fragment {
         let n = dir.normalize();
@@ -327,7 +388,9 @@ mod tests {
 
     #[test]
     fn el_oceano_responde_a_la_luz_distinto_que_la_tierra() {
-        let r = Rocky::default();
+        // Sin nubes, para medir sólo cómo responde el material a la luz.
+        let mut r = Rocky::default();
+        r.cobertura_nubes = 0.0;
         let agua = ganancia_especular_media(&r, true);
         let tierra = ganancia_especular_media(&r, false);
         assert!(agua > 0.03, "el océano debería reflejar: {agua}");
@@ -340,10 +403,84 @@ mod tests {
     #[test]
     fn apagar_el_brillo_del_oceano_lo_deja_mate() {
         let mut r = Rocky::default();
+        r.cobertura_nubes = 0.0;
         let con = ganancia_especular_media(&r, true);
         r.brillo_oceano = 0.0;
         let sin = ganancia_especular_media(&r, true);
         assert!(con > sin + 0.03, "con {con}, sin {sin}");
+    }
+
+    #[test]
+    fn las_nubes_se_mueven_con_el_tiempo() {
+        let r = Rocky::default();
+        let mut dif = 0.0;
+        for i in 0..400 {
+            let a = i as f32 * 0.31;
+            let p = v3(a.cos(), (a * 0.41).sin() * 0.7, a.sin()).normalize();
+            dif += (r.nubes(p, 0.0) - r.nubes(p, 40.0)).abs();
+        }
+        assert!(dif / 400.0 > 0.05, "la capa de nubes debería desplazarse");
+    }
+
+    #[test]
+    fn la_cobertura_controla_cuanta_nube_hay() {
+        let media = |c: f32| {
+            let mut r = Rocky::default();
+            r.cobertura_nubes = c;
+            let n = 1200;
+            (0..n)
+                .map(|i| {
+                    let a = i as f32 * 0.17;
+                    let p = v3(a.sin(), (a * 0.6).cos() * 0.9, (a * 1.3).cos()).normalize();
+                    r.nubes(p, 0.0)
+                })
+                .sum::<f32>()
+                / n as f32
+        };
+        let poca = media(0.15);
+        let mucha = media(0.80);
+        assert!(mucha > poca + 0.2, "poca {poca}, mucha {mucha}");
+    }
+
+    #[test]
+    fn la_sombra_se_desplaza_con_la_direccion_de_la_luz() {
+        let r = Rocky::default();
+        let mut distintas = 0;
+        let mut comparadas = 0;
+        for i in 0..600 {
+            let a = i as f32 * 0.23;
+            let p = v3(a.cos(), (a * 0.47).sin() * 0.6, a.sin()).normalize();
+            let (t, b) = tangent_frame(p);
+            // Dos luces rasantes opuestas: la sombra debe caer en lados distintos.
+            let l1 = (p * 0.45 + t * 0.89).normalize();
+            let l2 = (p * 0.45 - t * 0.89).normalize();
+            let s1 = r.sombra_nubes(p, p, l1, 0.0);
+            let s2 = r.sombra_nubes(p, p, l2, 0.0);
+            comparadas += 1;
+            if (s1 - s2).abs() > 0.15 {
+                distintas += 1;
+            }
+            let _ = b;
+        }
+        assert!(
+            distintas as f32 / comparadas as f32 > 0.15,
+            "la sombra apenas cambió al mover la luz: {distintas}/{comparadas}"
+        );
+    }
+
+    #[test]
+    fn con_luz_cenital_la_sombra_coincide_con_la_nube() {
+        let r = Rocky::default();
+        let p = v3(0.2, 0.3, 0.9).normalize();
+        let s = r.sombra_nubes(p, p, p, 0.0);
+        assert!((s - r.nubes(p, 0.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn de_noche_no_se_proyectan_sombras() {
+        let r = Rocky::default();
+        let p = v3(0.0, 0.0, 1.0);
+        assert_eq!(r.sombra_nubes(p, p, -p, 0.0), 0.0);
     }
 
     #[test]
