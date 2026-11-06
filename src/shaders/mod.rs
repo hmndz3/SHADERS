@@ -1,5 +1,7 @@
 //! Interfaz común de los fragment shaders y utilidades compartidas.
 
+pub mod star;
+
 use crate::math::{mix, saturate, v3, Vec3};
 
 /// Todo lo que el renderer entrega al shader para un píxel cubierto por la esfera.
