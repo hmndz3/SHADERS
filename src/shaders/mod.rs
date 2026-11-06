@@ -1,5 +1,6 @@
 //! Interfaz común de los fragment shaders y utilidades compartidas.
 
+pub mod gas;
 pub mod rocky;
 pub mod star;
 
