@@ -1,5 +1,6 @@
 //! Interfaz común de los fragment shaders y utilidades compartidas.
 
+pub mod rocky;
 pub mod star;
 
 use crate::math::{mix, saturate, v3, Vec3};
