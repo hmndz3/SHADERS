@@ -1,13 +1,14 @@
-//! Renderer por software: pasada de geometría, que rasteriza la malla con
-//! z-buffer en un buffer intermedio de posiciones y normales.
+//! Renderer por software: pasada de geometría (rasterizado con z-buffer) y pasada
+//! de fragmentos (los shaders), separadas para poder sombrear en paralelo.
 //!
 //! El modelo nunca se mueve: la que orbita es la cámara. Así el espacio objeto y el
 //! espacio mundo coinciden y los patrones quedan fijos a la esfera.
 
-use crate::framebuffer::background;
+use crate::framebuffer::{background, Framebuffer};
 use crate::math::{v3, Mat4, Vec3};
 use crate::noise::Noise;
 use crate::obj::Mesh;
+use crate::shaders::{Fragment, Shader, Uniforms};
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -207,12 +208,67 @@ impl Renderer {
         }
     }
 
+    /// Pasada de fragmentos: ejecuta el shader en cada píxel cubierto. Se reparte
+    /// por filas entre los núcleos disponibles.
+    pub fn shade_pass(
+        &self,
+        fb: &mut Framebuffer,
+        shader: &dyn Shader,
+        uniforms: &Uniforms,
+        camera: &Camera,
+        light: Vec3,
+    ) {
+        assert_eq!(fb.width, self.width);
+        assert_eq!(fb.height, self.height);
+        let eye = camera.eye();
+        let light = light.normalize();
+        let w = self.width;
+
+        fb.pixels
+            .par_chunks_mut(w)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for (x, px) in row.iter_mut().enumerate() {
+                    let idx = y * w + x;
+                    if !self.covered[idx] {
+                        *px = self.fondo[idx];
+                        continue;
+                    }
+                    let position = self.positions[idx];
+                    let normal = self.normals[idx];
+                    let view_dir = (eye - position).normalize();
+                    let frag = Fragment {
+                        dir: position.normalize(),
+                        normal,
+                        view_dir,
+                        light_dir: light,
+                        intensity: normal.dot(light).max(0.0),
+                    };
+                    *px = shader.shade(&frag, uniforms);
+                }
+            });
+    }
+
+    /// Dibuja un cuadro completo.
+    pub fn draw(
+        &mut self,
+        fb: &mut Framebuffer,
+        mesh: &Mesh,
+        shader: &dyn Shader,
+        uniforms: &Uniforms,
+        camera: &Camera,
+        light: Vec3,
+    ) {
+        self.geometry_pass(mesh, camera);
+        self.shade_pass(fb, shader, uniforms, camera, light);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::obj;
+    use crate::shaders::star::Star;
 
     fn esfera() -> Mesh {
         let mut m = obj::load_from_str(include_str!("../assets/sphere.obj")).unwrap();
@@ -289,4 +345,36 @@ mod tests {
         assert!((a - b).length() > 0.3, "la cámara no se movió: {a:?} {b:?}");
     }
 
+    #[test]
+    fn el_cuadro_completo_pinta_esfera_y_fondo() {
+        let mesh = esfera();
+        let mut r = Renderer::new(96, 96);
+        let mut fb = Framebuffer::new(96, 96);
+        let cam = Camera::default();
+        r.draw(
+            &mut fb,
+            &mesh,
+            &Star::default(),
+            &Uniforms { time: 0.0 },
+            &cam,
+            v3(1.0, 0.4, 0.8),
+        );
+        // Brillo medio del disco: la estrella es emisiva, así que debe ser alto
+        // aunque un píxel suelto caiga dentro de una mancha fría.
+        let mut suma = 0.0;
+        let mut n = 0;
+        for y in 0..96 {
+            for x in 0..96 {
+                if r.is_covered(x, y) {
+                    let c = fb.get(x, y);
+                    suma += (c.x + c.y + c.z) / 3.0;
+                    n += 1;
+                }
+            }
+        }
+        assert!(n > 500, "el disco debería ocupar varios píxeles");
+        let medio = suma / n as f32;
+        assert!(medio > 0.2, "la estrella debería brillar: medio {medio}");
+        assert!(fb.get(2, 2).length() < 0.2, "el fondo debería ser oscuro");
+    }
 }
