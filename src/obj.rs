@@ -1,7 +1,9 @@
 //! Cargador de OBJ. No modifica ni agrega vértices: solo triangula los polígonos
-//! que vengan con más de tres lados.
+//! que vengan con más de tres lados y calcula normales suavizadas promediando las
+//! normales de las caras que comparten cada posición (el OBJ trae normales planas).
 
 use crate::math::{v3, Vec3};
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
@@ -22,6 +24,29 @@ impl Mesh {
         self.indices.len() / 3
     }
 
+    /// Centra el modelo en el origen y lo escala para que su radio máximo sea 1.
+    /// Es una normalización de encuadre, no un cambio de forma ni de detalle.
+    pub fn fit_to_unit_sphere(&mut self) {
+        if self.vertices.is_empty() {
+            return;
+        }
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(f32::MIN);
+        for v in &self.vertices {
+            min = min.min_elem(v.position);
+            max = max.max_elem(v.position);
+        }
+        let center = (min + max) * 0.5;
+        let radius = self
+            .vertices
+            .iter()
+            .map(|v| (v.position - center).length())
+            .fold(0.0f32, f32::max)
+            .max(1e-6);
+        for v in &mut self.vertices {
+            v.position = (v.position - center) / radius;
+        }
+    }
 }
 
 fn parse_index(token: &str, len: usize) -> Option<usize> {
@@ -89,12 +114,41 @@ pub fn load_from_str(data: &str) -> Result<Mesh, String> {
         }
     }
 
-    // Normal provisional: la dirección desde el centro del modelo.
+    // Normales suavizadas: se promedian por posición (ponderadas por área, que es
+    // la longitud del producto cruz sin normalizar) y se comparten entre caras.
+    let mut accum: HashMap<[i32; 3], Vec3> = HashMap::new();
+    let key = |p: Vec3| -> [i32; 3] {
+        [
+            (p.x * 1e5).round() as i32,
+            (p.y * 1e5).round() as i32,
+            (p.z * 1e5).round() as i32,
+        ]
+    };
+    for tri in indices.chunks_exact(3) {
+        let (a, b, c) = (
+            positions[tri[0] as usize],
+            positions[tri[1] as usize],
+            positions[tri[2] as usize],
+        );
+        let face_normal = (b - a).cross(c - a);
+        for p in [a, b, c] {
+            *accum.entry(key(p)).or_insert(Vec3::ZERO) += face_normal;
+        }
+    }
+
     let vertices = positions
         .iter()
-        .map(|&p| Vertex {
-            position: p,
-            normal: p.normalize(),
+        .map(|&p| {
+            let n = accum
+                .get(&key(p))
+                .copied()
+                .unwrap_or(p)
+                .normalize();
+            let normal = if n.length() < 0.5 { p.normalize() } else { n };
+            Vertex {
+                position: p,
+                normal,
+            }
         })
         .collect();
 
@@ -104,7 +158,9 @@ pub fn load_from_str(data: &str) -> Result<Mesh, String> {
 pub fn load<P: AsRef<Path>>(path: P) -> Result<Mesh, String> {
     let data = std::fs::read_to_string(&path)
         .map_err(|e| format!("no se pudo leer {}: {e}", path.as_ref().display()))?;
-    load_from_str(&data)
+    let mut mesh = load_from_str(&data)?;
+    mesh.fit_to_unit_sphere();
+    Ok(mesh)
 }
 
 #[cfg(test)]
@@ -148,4 +204,35 @@ f 2 3 4
         assert!(load_from_str("# nada\n").is_err());
     }
 
+    #[test]
+    fn las_normales_quedan_normalizadas() {
+        let m = load_from_str(TETRA).unwrap();
+        for v in &m.vertices {
+            assert!((v.normal.length() - 1.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn la_esfera_del_laboratorio_carga_y_queda_unitaria() {
+        let mut m = load_from_str(include_str!("../assets/sphere.obj")).unwrap();
+        assert!(m.triangle_count() > 100, "la malla debería tener caras suficientes");
+        m.fit_to_unit_sphere();
+        let max = m
+            .vertices
+            .iter()
+            .map(|v| v.position.length())
+            .fold(0.0f32, f32::max);
+        assert!((max - 1.0).abs() < 1e-4);
+        // Las normales suavizadas deben apuntar casi hacia afuera en una esfera.
+        let mut alineadas = 0;
+        for v in &m.vertices {
+            if v.normal.dot(v.position.normalize()) > 0.9 {
+                alineadas += 1;
+            }
+        }
+        assert!(
+            alineadas as f32 / m.vertices.len() as f32 > 0.95,
+            "las normales suavizadas deberían seguir la esfera"
+        );
+    }
 }
